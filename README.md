@@ -1,7 +1,7 @@
 Disclaimer: This repository contains AI-Generated code.
 Reason: This tool is really just for me, I'm only releasing it publically because I feel like its a useful tool.
 
-##NOTE: THIS ONLY WORKS WITH PRISM LAUNCHER. NO OTHER LAUNCHER WILL WORK WITH THIS.##
+# **NOTE: THIS ONLY WORKS WITH PRISM LAUNCHER. NO OTHER LAUNCHER WILL WORK WITH THIS.**
 
 A basic Minecraft (Prism Launcher) backup/restore utility for devices like the Steam Deck or Steam Machine.
 
