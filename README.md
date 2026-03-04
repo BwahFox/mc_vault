@@ -26,3 +26,7 @@ You have to configure rclone yourself. Currently only tested with Google Drive a
 The cloud storage must be named "gdrive" and rclone must have full access to it.
 
 This doesn't interact with the game files in anyway other than copying and pasting them onto google drive. This should probably work with any version of minecraft java. I've only tested it on the latest version as of writing, though.
+
+Image:
+<img width="1151" height="810" alt="image" src="https://github.com/user-attachments/assets/30d0d1e8-9962-4058-92be-2174a506e4a0" />
+
