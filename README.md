@@ -5,23 +5,23 @@ Reason: This tool is really just for me, I'm only releasing it publically becaus
 
 A basic Minecraft (Prism Launcher) backup/restore utility for devices like the Steam Deck or Steam Machine.
 
-Dependencies:
-rclone
-tkinter
-python3
-Prism Launcher
+Dependencies: 
+rclone,
+tkinter,
+python3,
+Prism Launcher,
 
-Tested/Works on the following Operating Systems:
-Windows 11 25H2
-Arch Linux
-SteamOS
-Bazzite
+Tested/Works on the following Operating Systems: 
+Windows 11 25H2, 
+Arch Linux, 
+SteamOS, 
+Bazzite, 
 Note: For linux, both flatpak and non-flatpak versions of Prism Launcher were used.
 
-Untested/Known to not work on the following Operating Systems:
+Untested/Known to not work on the following Operating Systems: 
 MacOS (any version)
 
-Rclone Setup:
+Rclone Setup: 
 You have to configure rclone yourself. Currently only tested with Google Drive and USB backup.
 The cloud storage must be named "gdrive" and rclone must have full access to it.
 
