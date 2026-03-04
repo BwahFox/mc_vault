@@ -9,13 +9,13 @@ Dependencies:
 rclone,
 tkinter,
 python3,
-Prism Launcher,
+Prism Launcher
 
 Tested/Works on the following Operating Systems: 
 Windows 11 25H2, 
 Arch Linux, 
 SteamOS, 
-Bazzite, 
+Bazzite,
 Note: For linux, both flatpak and non-flatpak versions of Prism Launcher were used.
 
 Untested/Known to not work on the following Operating Systems: 
