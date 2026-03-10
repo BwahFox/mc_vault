@@ -40,6 +40,8 @@ APP_NAME = "MC Vault"
 APP_VERSION = "0.3.1"
 CONFIG_VERSION = 1
 
+MCVAULT_TEMP_DIR = Path.home() / ".temp" / "mc_vault"
+
 REMOTE_DEFAULT = os.environ.get("REMOTE", "gdrive:MinecraftVault")
 
 _candidate_rclone = Path.home() / ".bin" / "rclone" / "rclone"
@@ -516,7 +518,7 @@ class RcloneBackend(BackendBase):
         return res.returncode == 0 and bool((res.stdout or "").strip())
 
     def download_remote_config(self, dest: Path, log: Callable[[str], None]) -> bool:
-        tmp = Path(tempfile.gettempdir()) / f"mcvault_rcfg_{uuid.uuid4().hex}.json"
+        tmp = MCVAULT_TEMP_DIR / f"mcvault_rcfg_{uuid.uuid4().hex}.json"
         safe_unlink(tmp)
         rc = stream_cmd([self.rclone, "copyto", self._cfg_remote(), str(tmp)], log)
         if rc != 0 or not tmp.exists():
@@ -723,7 +725,8 @@ def extract_restore_world(zip_path: Path, dest_world_dir: Path) -> None:
     Extract a validated backup zip. Finds level.dat inside the extracted
     tree and moves its parent directory to dest_world_dir.
     """
-    tmpdir = Path(tempfile.mkdtemp(prefix="mcvault-restore-"))
+    tmpdir = MCVAULT_TEMP_DIR / f"mcvault-restore-{uuid.uuid4().hex}"
+    tmpdir.mkdir(parents=True, exist_ok=True)
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
             zf.extractall(tmpdir)
@@ -787,7 +790,8 @@ def backup_operation(
     # Create zip
     ts = local_timestamp()
     zip_name = f"{local_world}_{ts}.zip"
-    tmp_zip = Path(tempfile.gettempdir()) / zip_name
+    tmp_zip = MCVAULT_TEMP_DIR / zip_name
+    MCVAULT_TEMP_DIR.mkdir(parents=True, exist_ok=True)
     log(f"Zipping {world_path.name}...")
     zip_world_folder(world_path, tmp_zip, exclude_relpaths=exclude)
 
@@ -820,7 +824,8 @@ def restore_operation(
       1. Validate backup BEFORE touching any local files.
       2. Never overwrite — rename existing world first.
     """
-    tmp_zip = Path(tempfile.gettempdir()) / f"mcvault_restore_{uuid.uuid4().hex}.zip"
+    tmp_zip = MCVAULT_TEMP_DIR / f"mcvault_restore_{uuid.uuid4().hex}.zip"
+    MCVAULT_TEMP_DIR.mkdir(parents=True, exist_ok=True)
     safe_unlink(tmp_zip)
 
     # Download
@@ -888,6 +893,9 @@ class VaultGUI:
         self.root.geometry("920x620")
         self.root.minsize(640, 400)
 
+        # Clean up / create temp directory on startup
+        self._init_temp_dir()
+
         # Thread-safe log queue
         self._log_q: "queue.Queue[str]" = queue.Queue()
 
@@ -903,6 +911,9 @@ class VaultGUI:
         self._build_ui()
         self._apply_theme()
 
+        # Hook window close button
+        self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
+
         # Start log pump
         self.root.after(50, self._pump_log)
 
@@ -914,6 +925,18 @@ class VaultGUI:
 
         # Non-blocking config sync on launch
         self._run_threaded(self._config_sync_on_launch)
+
+    # ------------------------------------------------------------------ temp
+    def _init_temp_dir(self) -> None:
+        """Clear and recreate the MC Vault temp directory on startup."""
+        if MCVAULT_TEMP_DIR.exists():
+            shutil.rmtree(MCVAULT_TEMP_DIR, ignore_errors=True)
+        MCVAULT_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+    def _on_closing(self) -> None:
+        """Clean up temp directory then destroy the window."""
+        shutil.rmtree(MCVAULT_TEMP_DIR, ignore_errors=True)
+        self.root.destroy()
 
     # ------------------------------------------------------------------ log
     def log(self, msg: str) -> None:
@@ -1028,7 +1051,7 @@ class VaultGUI:
         ttk.Button(bar, text="⬇ Restore", command=self._on_restore).pack(side="left", padx=6)
         ttk.Button(bar, text="📋 List Remote", command=self._on_list_remote).pack(side="left")
         ttk.Button(bar, text="⚙ Settings", command=self._on_settings).pack(side="left", padx=6)
-        ttk.Button(bar, text="Quit", command=self.root.destroy).pack(side="right")
+        ttk.Button(bar, text="Quit", command=self._on_closing).pack(side="right")
 
         # Info strip
         self._info_var = tk.StringVar(value=self._info_text())
@@ -1175,7 +1198,7 @@ class VaultGUI:
     def _attempt_remote_config_upload(self) -> None:
         if not self.backend.config_sync_supported():
             return
-        tmp_remote = Path(tempfile.gettempdir()) / f"mcvault_upload_cfg_{uuid.uuid4().hex}.json"
+        tmp_remote = MCVAULT_TEMP_DIR / f"mcvault_upload_cfg_{uuid.uuid4().hex}.json"
         try:
             # Always save the full config locally (device-local keys included)
             write_json(self.cfg_path, self.cfg)
@@ -1209,7 +1232,7 @@ class VaultGUI:
             return
 
         # Download remote to temp and compare timestamps
-        tmp = Path(tempfile.gettempdir()) / f"mcvault_rcfg_{uuid.uuid4().hex}.json"
+        tmp = MCVAULT_TEMP_DIR / f"mcvault_rcfg_{uuid.uuid4().hex}.json"
         safe_unlink(tmp)
         try:
             downloaded = self.backend.download_remote_config(tmp, self.log)
