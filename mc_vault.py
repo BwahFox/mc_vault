@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MC Vault v0.3.1 — Cross-platform GUI tool for backing up and restoring
+MC Vault v0.4.0 — Cross-platform GUI/TUI tool for backing up and restoring
 Minecraft Java worlds for PrismLauncher instances.
 
 Single-file architecture. See DESIGN.md for full specification.
@@ -8,7 +8,8 @@ Single-file architecture. See DESIGN.md for full specification.
 Requires:
   - Python 3.9+
   - rclone installed and configured (for Rclone backend)
-  - tkinter (ships with most Python installations)
+  - tkinter (ships with most Python installations; GUI mode only)
+  - windows-curses (pip install windows-curses; Windows TUI mode only)
 
 Environment variables (optional overrides):
   REMOTE  — rclone remote root (default: gdrive:MinecraftVault)
@@ -37,7 +38,7 @@ import tkinter as tk
 from tkinter import ttk
 
 APP_NAME = "MC Vault"
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.4.0"
 CONFIG_VERSION = 1
 
 MCVAULT_TEMP_DIR = Path.home() / ".temp" / "mc_vault"
@@ -255,6 +256,9 @@ def default_config() -> Dict:
         "dh_remember_choice": False,
         "usb_root": "",
         "usb_vault_name": "MinecraftVault",
+        "standalone_world_dir": "",
+        "force_standalone": False,
+        "drive_chunk_size": "256M",
     }
 
 
@@ -299,7 +303,7 @@ def touch_config(cfg: Dict) -> Dict:
 
 # Keys that are device-specific and must never be synced to the cloud.
 # Each device manages these independently.
-_DEVICE_LOCAL_KEYS = ("rclone_cmd", "usb_root")
+_DEVICE_LOCAL_KEYS = ("rclone_cmd", "usb_root", "standalone_world_dir", "force_standalone")
 
 
 def strip_device_local_keys(cfg: Dict) -> Dict:
@@ -371,6 +375,43 @@ def list_local_worlds(prism_root: Path, instance: str) -> List[str]:
     return sorted(w.name for w in saves.iterdir() if w.is_dir())
 
 
+def resolve_world_source(cfg: Dict) -> Tuple[Optional[Path], Optional[str], Optional[str], Optional[Path]]:
+    """
+    Determine where worlds live on this machine.
+
+    Returns a 4-tuple: (prism_root, instance, world_name, standalone_path)
+
+    Exactly one of these two cases is non-None:
+      - Prism mode:       (prism_root, None, None, None)  — caller must pick instance+world
+      - Standalone mode:  (None, None, None, world_path)  — world folder is fixed
+
+    Raises RuntimeError if neither is available.
+    """
+    # Try PrismLauncher first (unless force_standalone is set)
+    if not cfg.get("force_standalone"):
+        try:
+            prism_root = find_prism_root()
+            return (prism_root, None, None, None)
+        except RuntimeError:
+            pass
+
+    # Fall back to configured standalone world dir
+    raw = (cfg.get("standalone_world_dir") or "").strip()
+    if raw:
+        p = Path(raw).expanduser().resolve()
+        if p.is_dir():
+            return (None, None, None, p)
+        raise RuntimeError(
+            f"Standalone world dir is configured but not found: {p}\n"
+            f"Check Settings → Set standalone world dir."
+        )
+
+    raise RuntimeError(
+        "Could not locate PrismLauncher and no standalone world dir is configured.\n"
+        "Use Settings → Set standalone world dir to point at your world folder."
+    )
+
+
 # =============================================================================
 # Backend Layer
 # =============================================================================
@@ -434,9 +475,10 @@ class RcloneBackend(BackendBase):
     """Cloud storage backend using rclone."""
     name = "rclone"
 
-    def __init__(self, remote_root: str, rclone_cmd: str):
+    def __init__(self, remote_root: str, rclone_cmd: str, drive_chunk_size: str = "256M"):
         self.remote = remote_root.rstrip("/")
         self.rclone = rclone_cmd
+        self.drive_chunk_size = drive_chunk_size or "256M"
 
     def _remote_path(self, *parts: str) -> str:
         cleaned = [sanitize_path_component(p) for p in parts]
@@ -472,8 +514,10 @@ class RcloneBackend(BackendBase):
         clear: Optional[Callable[[], None]] = None,
     ) -> None:
         dest = f"{self._remote_path(instance, world)}/{zip_name}"
-        log(f"Uploading → {dest}")
-        rc = stream_cmd([self.rclone, "copyto", "--progress", str(local_zip), dest], log, clear)
+        log(f"Uploading → {dest} (chunk size: {self.drive_chunk_size})")
+        rc = stream_cmd([self.rclone, "copyto", "--progress",
+                         f"--drive-chunk-size={self.drive_chunk_size}",
+                         str(local_zip), dest], log, clear)
         if rc != 0:
             raise BackendError(f"rclone upload failed (exit code {rc})")
 
@@ -654,6 +698,7 @@ def build_backend(cfg: Dict) -> BackendBase:
     return RcloneBackend(
         cfg.get("remote_root", REMOTE_DEFAULT),
         cfg.get("rclone_cmd", RCLONE_DEFAULT),
+        cfg.get("drive_chunk_size", "256M"),
     )
 
 
@@ -747,8 +792,7 @@ def extract_restore_world(zip_path: Path, dest_world_dir: Path) -> None:
 # =============================================================================
 
 def backup_operation(
-    prism_root: Path,
-    local_inst: str,
+    world_path: Path,
     local_world: str,
     remote_instance: str,
     backend: BackendBase,
@@ -760,10 +804,9 @@ def backup_operation(
     """
     Worker-thread operation: zip world → upload → prune.
     No GUI interaction — only calls log() / clear() for output.
+    world_path  — absolute path to the world folder to zip.
+    local_world — world name used for the zip filename and remote path.
     """
-    world_path = (
-        instance_mcdir(prism_root / "instances" / local_inst) / "saves" / local_world
-    )
     if not world_path.is_dir():
         raise RuntimeError(f"World folder not found: {world_path}")
 
@@ -807,22 +850,29 @@ def backup_operation(
 
 
 def restore_operation(
-    prism_root: Path,
-    local_inst: str,
+    dest_saves_dir: Optional[Path],
     remote_instance: str,
     remote_world: str,
     backup_zip: str,
     backend: BackendBase,
     log: Callable[[str], None],
+    standalone_world_path: Optional[Path] = None,
     clear: Optional[Callable[[], None]] = None,
 ) -> None:
     """
-    Worker-thread operation: download → validate → safe rename → extract.
+    Worker-thread operation: download → validate → extract.
     No GUI interaction — only calls log() / clear() for output.
 
-    Safety rules enforced:
+    Two modes:
+      Prism mode:      dest_saves_dir is the saves/ folder; world is placed inside it.
+                       Existing world is renamed (safe backup) before extraction.
+      Standalone mode: standalone_world_path is the world folder itself.
+                       The folder is REPLACED IN PLACE — caller must confirm first.
+
+    Safety rules:
       1. Validate backup BEFORE touching any local files.
-      2. Never overwrite — rename existing world first.
+      2. Prism mode: rename existing world rather than overwrite.
+      3. Standalone mode: delete existing folder then extract (in-place replace).
     """
     tmp_zip = MCVAULT_TEMP_DIR / f"mcvault_restore_{uuid.uuid4().hex}.zip"
     MCVAULT_TEMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -839,19 +889,26 @@ def restore_operation(
             "Backup is invalid — no level.dat found. Restore aborted; no local files were changed."
         )
 
-    saves = instance_mcdir(prism_root / "instances" / local_inst) / "saves"
-    ensure_dir(saves)
-
-    target = saves / remote_world
-    if target.exists():
-        # SAFETY: Rename, never overwrite
-        safe_name = f"{remote_world}.before_restore_{local_timestamp()}"
-        renamed = saves / safe_name
-        target.rename(renamed)
-        log(f"Existing world renamed → {safe_name}")
-
-    log("Extracting backup...")
-    extract_restore_world(tmp_zip, target)
+    if standalone_world_path is not None:
+        # Standalone: replace world folder in-place
+        target = standalone_world_path
+        if target.exists():
+            log(f"Removing existing world folder: {target}")
+            shutil.rmtree(target)
+        log("Extracting backup...")
+        extract_restore_world(tmp_zip, target)
+    else:
+        # Prism: place world inside saves/, rename if already exists
+        assert dest_saves_dir is not None
+        ensure_dir(dest_saves_dir)
+        target = dest_saves_dir / remote_world
+        if target.exists():
+            safe_name = f"{remote_world}.before_restore_{local_timestamp()}"
+            renamed = dest_saves_dir / safe_name
+            target.rename(renamed)
+            log(f"Existing world renamed → {safe_name}")
+        log("Extracting backup...")
+        extract_restore_world(tmp_zip, target)
 
     safe_unlink(tmp_zip)
     log("✓ Restore complete.")
@@ -923,8 +980,6 @@ class VaultGUI:
                  f"KEEP: {self.cfg.get('keep_backups')}  |  "
                  f"DH: {self.cfg.get('dh_policy')}")
 
-        # Non-blocking config sync on launch
-        self._run_threaded(self._config_sync_on_launch)
 
     # ------------------------------------------------------------------ temp
     def _init_temp_dir(self) -> None:
@@ -1288,6 +1343,7 @@ class VaultGUI:
     # --------------------------------------------------------- GUI actions
     def _on_settings(self) -> None:
         c = self.cfg
+        standalone = c.get("standalone_world_dir") or "(not set)"
         options = [
             f"Set backend (current: {c.get('default_backend')})",
             f"Select USB drive (current: {c.get('usb_root') or '(not set)'})",
@@ -1298,6 +1354,9 @@ class VaultGUI:
             f"Toggle DH remember choice (current: {'on' if c.get('dh_remember_choice') else 'off'})",
             f"Set REMOTE root (current: {c.get('remote_root')})",
             f"Set RCLONE command (current: {c.get('rclone_cmd')})",
+            f"Set standalone world dir (current: {standalone})",
+            f"Toggle force standalone  (current: {'on' if c.get('force_standalone') else 'off'})",
+            f"Set drive chunk size     (current: {c.get('drive_chunk_size', '256M')})",
         ]
         choice = self.pick("Settings", "Choose a setting to change:", options)
         if not choice:
@@ -1374,12 +1433,34 @@ class VaultGUI:
                 if s is not None:
                     self.cfg["rclone_cmd"] = s.strip()
 
+            elif choice.startswith("Set standalone"):
+                s = self.enter_text(
+                    "Standalone World Dir",
+                    "Path to world folder (e.g. ~/minecraft/world).\n"
+                    "Leave blank to clear (use PrismLauncher instead):",
+                    self.cfg.get("standalone_world_dir", ""),
+                )
+                if s is not None:
+                    self.cfg["standalone_world_dir"] = s.strip()
+
+            elif choice.startswith("Toggle force standalone"):
+                self.cfg["force_standalone"] = not self.cfg.get("force_standalone", False)
+
+            elif choice.startswith("Set drive chunk"):
+                s = self.enter_text(
+                    "Drive Chunk Size",
+                    "rclone chunk size for uploads (e.g. 256M, 128M, 512M).\n"
+                    "Larger chunks = fewer retries on big files:",
+                    self.cfg.get("drive_chunk_size", "256M"),
+                )
+                if s is not None:
+                    self.cfg["drive_chunk_size"] = s.strip() or "256M"
+
             touch_config(self.cfg)
             self._save_config_local()
             self.backend = build_backend(self.cfg)
             self._apply_theme()
             self._refresh_info()
-            self._run_threaded(self._attempt_remote_config_upload)
             self.log("Settings updated.")
 
         except Exception as exc:
@@ -1388,24 +1469,30 @@ class VaultGUI:
     def _on_backup(self) -> None:
         """Gather user selections on UI thread, then run backup on worker thread."""
         try:
-            prism_root = find_prism_root()
-            instances = list_local_instances(prism_root)
-            if not instances:
-                self.log("ERROR: No PrismLauncher instances found.")
-                return
+            prism_root, _, _, standalone_path = resolve_world_source(self.cfg)
 
-            local_inst = self.pick("Choose Instance", "Select the local instance to back up from:", instances)
-            if not local_inst:
-                return
-
-            worlds = list_local_worlds(prism_root, local_inst)
-            if not worlds:
-                self.log("ERROR: No worlds found in this instance.")
-                return
-
-            world = self.pick("Choose World", "Select the world to back up:", worlds)
-            if not world:
-                return
+            if standalone_path is not None:
+                # Standalone mode: world is fixed
+                world = standalone_path.name
+                world_path = standalone_path
+                local_inst = None
+            else:
+                instances = list_local_instances(prism_root)
+                if not instances:
+                    self.log("ERROR: No PrismLauncher instances found.")
+                    return
+                local_inst = self.pick("Choose Instance",
+                                       "Select the local instance to back up from:", instances)
+                if not local_inst:
+                    return
+                worlds = list_local_worlds(prism_root, local_inst)
+                if not worlds:
+                    self.log("ERROR: No worlds found in this instance.")
+                    return
+                world = self.pick("Choose World", "Select the world to back up:", worlds)
+                if not world:
+                    return
+                world_path = instance_mcdir(prism_root / "instances" / local_inst) / "saves" / world
 
             # Choose destination instance folder on the backend
             remote_insts = []
@@ -1414,7 +1501,8 @@ class VaultGUI:
             except Exception:
                 pass
 
-            ordered = [local_inst] + [r for r in remote_insts if r != local_inst]
+            default_folder = local_inst or world
+            ordered = [default_folder] + [r for r in remote_insts if r != default_folder]
             ordered.append("[Create new folder...]")
             remote_inst = self.pick(
                 "Destination Folder",
@@ -1425,17 +1513,14 @@ class VaultGUI:
                 return
             if remote_inst == "[Create new folder...]":
                 remote_inst = self.enter_text(
-                    "New Folder", "Enter remote instance folder name:", local_inst,
+                    "New Folder", "Enter remote instance folder name:", default_folder,
                 )
                 if not remote_inst:
                     return
 
             # Distant Horizons prompt
             dh_choice: Optional[str] = None
-            inst_path = prism_root / "instances" / local_inst
-            world_path = instance_mcdir(inst_path) / "saves" / world
             has_dh, sz, _ = dh_detect(world_path)
-
             if has_dh:
                 if self.cfg.get("dh_remember_choice"):
                     dh_choice = self.cfg.get("dh_policy", "exclude")
@@ -1443,8 +1528,7 @@ class VaultGUI:
                     raw = self.pick(
                         "Distant Horizons Detected",
                         f"DistantHorizons.sqlite found (~{format_size(sz)}).\n"
-                        f"What should this backup do?\n\n"
-                        f"Default: exclude (recommended).",
+                        f"What should this backup do?\n\nDefault: exclude (recommended).",
                         ["exclude", "include", "delete locally"],
                     )
                     if not raw:
@@ -1456,8 +1540,7 @@ class VaultGUI:
                 self.clear_log()
                 try:
                     backup_operation(
-                        prism_root=prism_root,
-                        local_inst=local_inst,
+                        world_path=world_path,
                         local_world=world,
                         remote_instance=remote_inst,
                         backend=self.backend,
@@ -1477,17 +1560,33 @@ class VaultGUI:
     def _on_restore(self) -> None:
         """Gather user selections on UI thread, then run restore on worker thread."""
         try:
-            prism_root = find_prism_root()
-            instances = list_local_instances(prism_root)
-            if not instances:
-                self.log("ERROR: No PrismLauncher instances found.")
-                return
+            prism_root, _, _, standalone_path = resolve_world_source(self.cfg)
 
-            local_inst = self.pick(
-                "Restore Target", "Select the LOCAL instance to restore INTO:", instances,
-            )
-            if not local_inst:
-                return
+            if standalone_path is not None:
+                # Standalone mode: warn that restore will overwrite the server world
+                confirm = self.pick(
+                    "Warning",
+                    "⚠ STANDALONE MODE: Restoring will OVERWRITE the server world folder.\n"
+                    f"  {standalone_path}\n\n"
+                    "The existing world will be deleted before extraction.\n"
+                    "Continue?",
+                    ["Yes, overwrite", "Cancel"],
+                )
+                if not confirm or confirm.startswith("Cancel"):
+                    return
+                local_inst = None
+                dest_saves_dir = None
+            else:
+                instances = list_local_instances(prism_root)
+                if not instances:
+                    self.log("ERROR: No PrismLauncher instances found.")
+                    return
+                local_inst = self.pick(
+                    "Restore Target", "Select the LOCAL instance to restore INTO:", instances,
+                )
+                if not local_inst:
+                    return
+                dest_saves_dir = instance_mcdir(prism_root / "instances" / local_inst) / "saves"
 
             remote_insts = self.backend.list_instances()
             if not remote_insts:
@@ -1522,13 +1621,13 @@ class VaultGUI:
                 self.clear_log()
                 try:
                     restore_operation(
-                        prism_root=prism_root,
-                        local_inst=local_inst,
+                        dest_saves_dir=dest_saves_dir,
                         remote_instance=remote_inst,
                         remote_world=world,
                         backup_zip=backup,
                         backend=self.backend,
                         log=self.log,
+                        standalone_world_path=standalone_path,
                         clear=self.clear_log,
                     )
                 except Exception as exc:
@@ -1566,9 +1665,898 @@ def _safe_attr(win: tk.Toplevel, attr: str, value) -> None:
 
 
 # =============================================================================
+# TUI Layer (curses)
+# =============================================================================
+
+try:
+    import curses
+    import curses.textpad
+    _CURSES_AVAILABLE = True
+except ImportError:
+    _CURSES_AVAILABLE = False
+
+
+# Colour-pair indices
+_CP_NORMAL   = 0   # default (pair 0 is always white-on-black)
+_CP_HEADER   = 1   # accent: blue-on-default
+_CP_SELECTED = 2   # reverse highlight for menu cursor
+_CP_DIM      = 3   # dimmed info text
+_CP_ERROR    = 4   # red for errors / warnings
+_CP_OK       = 5   # green for success lines
+
+
+def _init_colors() -> None:
+    """Initialise colour pairs; degrades gracefully on monochrome terminals."""
+    if not curses.has_colors():
+        return
+    curses.start_color()
+    curses.use_default_colors()
+    bg = -1  # transparent background
+
+    try:
+        curses.init_pair(_CP_HEADER,   curses.COLOR_BLUE,  bg)
+        curses.init_pair(_CP_SELECTED, curses.COLOR_BLACK, curses.COLOR_BLUE)
+        curses.init_pair(_CP_DIM,      curses.COLOR_WHITE, bg)
+        curses.init_pair(_CP_ERROR,    curses.COLOR_RED,   bg)
+        curses.init_pair(_CP_OK,       curses.COLOR_GREEN, bg)
+    except Exception:
+        pass
+
+
+def _line_attr(line: str) -> int:
+    """Choose a curses attribute based on the content of a log line."""
+    if not curses.has_colors():
+        return 0
+    lo = line.lower()
+    if lo.startswith("error") or "ERROR" in line:
+        return curses.color_pair(_CP_ERROR)
+    if lo.startswith("warn") or "WARN" in line:
+        return curses.color_pair(_CP_ERROR)
+    if "✓" in line or "complete" in line.lower():
+        return curses.color_pair(_CP_OK)
+    return 0
+
+
+class VaultTUI:
+    """
+    Full-screen curses TUI that mirrors VaultGUI's interaction model.
+    Layout:
+      ┌─ title bar ──────────────────────────────┐
+      │ info strip                               │
+      ├──────────────────────────────────────────┤
+      │ scrollable log  (upper ~60% of screen)  │
+      ├──────────────────────────────────────────┤
+      │ menu / picker   (lower ~40% of screen)  │
+      └──────────────────────────────────────────┘
+    """
+
+    # ------------------------------------------------------------------ init
+    def __init__(self) -> None:
+        self.cfg_path = config_local_path()
+        self.cfg = normalize_config(read_json(self.cfg_path) or default_config())
+        self.backend: BackendBase = build_backend(self.cfg)
+
+        self._log_lines: List[str] = []
+        self._log_scroll = 0   # lines scrolled from bottom (0 = pinned to bottom)
+
+        # curses screen — set up in run()
+        self._scr: "curses.window" = None  # type: ignore[assignment]
+
+    # ------------------------------------------------------------------ run
+    def run(self) -> None:
+        """Entry point — wraps curses.wrapper so the terminal is always restored."""
+        curses.wrapper(self._main)
+
+    def _main(self, scr: "curses.window") -> None:
+        self._scr = scr
+        curses.curs_set(0)
+        _init_colors()
+        MCVAULT_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+        self.log(f"{APP_NAME} v{APP_VERSION} ready.")
+        self.log(
+            f"Backend: {self.cfg.get('default_backend')}  |  "
+            f"KEEP: {self.cfg.get('keep_backups')}  |  "
+            f"DH: {self.cfg.get('dh_policy')}"
+        )
+        self._main_menu()
+
+        # Cleanup temp dir on exit
+        shutil.rmtree(MCVAULT_TEMP_DIR, ignore_errors=True)
+
+    # ------------------------------------------------------------------ log
+    def log(self, msg: str) -> None:
+        """Append a line to the log buffer and redraw the log panel."""
+        self._log_lines.append(str(msg))
+        # Keep buffer from growing unbounded
+        if len(self._log_lines) > 2000:
+            self._log_lines = self._log_lines[-2000:]
+        if self._scr is not None:
+            self._draw_log()
+            self._scr.refresh()
+
+    def clear_log(self) -> None:
+        self._log_lines.clear()
+        self._log_scroll = 0
+        if self._scr is not None:
+            self._draw_log()
+            self._scr.refresh()
+
+    # ------------------------------------------------------------------ layout helpers
+    def _dimensions(self):
+        """Return (rows, cols, log_rows, menu_row) given current terminal size."""
+        rows, cols = self._scr.getmaxyx()
+        # Log panel: top 60% (at least 4 rows), rest goes to menu area
+        log_rows = max(4, int(rows * 0.60))
+        # row where the separator + menu area starts
+        menu_row = log_rows + 2  # +2 for title + info rows
+        return rows, cols, log_rows, menu_row
+
+    def _draw_chrome(self) -> None:
+        """Draw title bar and info strip."""
+        rows, cols, log_rows, menu_row = self._dimensions()
+        scr = self._scr
+
+        # Title bar (row 0)
+        title = f" {APP_NAME} v{APP_VERSION} "
+        try:
+            scr.addstr(0, 0, title.ljust(cols),
+                       curses.color_pair(_CP_HEADER) | curses.A_BOLD)
+        except curses.error:
+            pass
+
+        # Info strip (row 1)
+        c = self.cfg
+        info = (
+            f" Backend:{c.get('default_backend')}  "
+            f"Remote:{c.get('remote_root')}  "
+            f"KEEP:{c.get('keep_backups')}  "
+            f"DH:{c.get('dh_policy')}"
+        )
+        try:
+            scr.addstr(1, 0, info[:cols - 1].ljust(cols - 1),
+                       curses.color_pair(_CP_DIM))
+        except curses.error:
+            pass
+
+        # Separator between log and menu
+        sep_row = log_rows + 2
+        try:
+            scr.addstr(sep_row, 0, "─" * (cols - 1),
+                       curses.color_pair(_CP_DIM))
+        except curses.error:
+            pass
+
+    def _draw_log(self) -> None:
+        """Render the log panel (rows 2 .. log_rows+1)."""
+        if self._scr is None:
+            return
+        rows, cols, log_rows, menu_row = self._dimensions()
+        scr = self._scr
+
+        # Determine which log lines are visible
+        total = len(self._log_lines)
+        # _log_scroll == 0 means pinned to bottom
+        end = total - self._log_scroll
+        start = max(0, end - log_rows)
+        visible = self._log_lines[start:end]
+
+        for i in range(log_rows):
+            screen_row = i + 2  # offset for title + info
+            try:
+                scr.move(screen_row, 0)
+                scr.clrtoeol()
+            except curses.error:
+                pass
+            if i < len(visible):
+                line = visible[i]
+                attr = _line_attr(line)
+                try:
+                    scr.addnstr(screen_row, 0, line, cols - 1, attr)
+                except curses.error:
+                    pass
+
+    def _draw_menu(self, items: List[str], cursor: int,
+                   prompt: str = "", first_menu_row: int = 0) -> None:
+        """Render a menu/picker list starting at first_menu_row."""
+        rows, cols, log_rows, menu_row = self._dimensions()
+        scr = self._scr
+
+        # Clear the menu area
+        for r in range(first_menu_row, rows - 1):
+            try:
+                scr.move(r, 0)
+                scr.clrtoeol()
+            except curses.error:
+                pass
+
+        # Prompt
+        if prompt:
+            try:
+                scr.addnstr(first_menu_row, 0, prompt, cols - 1,
+                            curses.color_pair(_CP_DIM))
+            except curses.error:
+                pass
+            first_menu_row += 1
+
+        available = rows - first_menu_row - 1  # rows available for list items
+
+        # Scroll the list so cursor is always visible
+        list_start = 0
+        if cursor >= available:
+            list_start = cursor - available + 1
+
+        for i, item in enumerate(items[list_start: list_start + available]):
+            r = first_menu_row + i
+            if r >= rows - 1:
+                break
+            idx = list_start + i
+            if idx == cursor:
+                attr = curses.color_pair(_CP_SELECTED) | curses.A_BOLD
+                text = f" > {item} "
+            else:
+                attr = 0
+                text = f"   {item} "
+            try:
+                scr.addnstr(r, 0, text, cols - 1, attr)
+            except curses.error:
+                pass
+
+        # Footer hint
+        hint = " ↑↓/jk navigate  Enter select  Esc back "
+        try:
+            scr.addnstr(rows - 1, 0, hint[:cols - 1], cols - 1,
+                        curses.color_pair(_CP_DIM))
+        except curses.error:
+            pass
+
+    # ------------------------------------------------------------------ interaction primitives
+    def pick(self, _title: str, prompt: str, items: List[str]) -> Optional[str]:
+        """
+        Full-screen list picker. Returns the chosen string or None on cancel.
+        Navigated with ↑/↓, j/k, Enter, Esc.
+        """
+        if not items:
+            return None
+
+        scr = self._scr
+        rows, cols, log_rows, menu_row = self._dimensions()
+        cursor = 0
+
+        while True:
+            scr.erase()
+            self._draw_chrome()
+            self._draw_log()
+            self._draw_menu(items, cursor, prompt=prompt,
+                            first_menu_row=menu_row + 1)
+            scr.refresh()
+
+            key = scr.getch()
+            if key in (curses.KEY_UP, ord("k")):
+                cursor = max(0, cursor - 1)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                cursor = min(len(items) - 1, cursor + 1)
+            elif key in (curses.KEY_PPAGE,):   # Page Up
+                cursor = max(0, cursor - 10)
+            elif key in (curses.KEY_NPAGE,):   # Page Down
+                cursor = min(len(items) - 1, cursor + 10)
+            elif key in (ord("\n"), ord("\r"), curses.KEY_ENTER):
+                return items[cursor]
+            elif key in (27, ord("q")):         # Esc or q
+                return None
+            elif key == curses.KEY_RESIZE:
+                rows, cols, log_rows, menu_row = self._dimensions()
+
+    def enter_text(self, _title: str, prompt: str, initial: str = "") -> Optional[str]:
+        """
+        Inline text entry drawn in the menu area. Returns entered text or None on cancel.
+        """
+        scr = self._scr
+        rows, cols, log_rows, menu_row = self._dimensions()
+        curses.curs_set(1)
+        buf = list(initial)
+        input_row = menu_row + 2
+
+        while True:
+            scr.erase()
+            self._draw_chrome()
+            self._draw_log()
+
+            # Clear menu area and draw prompt + input
+            for r in range(menu_row, rows - 1):
+                try:
+                    scr.move(r, 0)
+                    scr.clrtoeol()
+                except curses.error:
+                    pass
+            try:
+                scr.addnstr(menu_row + 1, 0, prompt, cols - 1,
+                            curses.color_pair(_CP_DIM))
+                field = "".join(buf)
+                scr.addnstr(input_row, 0, "> " + field + " ", cols - 1)
+                hint = " Enter confirm  Esc cancel  Backspace delete "
+                scr.addnstr(rows - 1, 0, hint[:cols - 1], cols - 1,
+                            curses.color_pair(_CP_DIM))
+            except curses.error:
+                pass
+
+            # Move cursor to end of input field
+            cursor_col = min(2 + len(buf), cols - 2)
+            try:
+                scr.move(input_row, cursor_col)
+            except curses.error:
+                pass
+
+            scr.refresh()
+            key = scr.getch()
+
+            if key in (ord("\n"), ord("\r"), curses.KEY_ENTER):
+                curses.curs_set(0)
+                result = "".join(buf).strip()
+                return result if result else None
+            elif key == 27:   # Esc
+                curses.curs_set(0)
+                return None
+            elif key in (curses.KEY_BACKSPACE, 127, 8):
+                if buf:
+                    buf.pop()
+            elif key == curses.KEY_RESIZE:
+                rows, cols, log_rows, menu_row = self._dimensions()
+                input_row = menu_row + 2
+            elif 32 <= key <= 126:   # printable ASCII
+                buf.append(chr(key))
+
+    # ------------------------------------------------------------------ config persistence
+    def _save_config_local(self) -> None:
+        try:
+            write_json(self.cfg_path, self.cfg)
+        except OSError as exc:
+            self.log(f"ERROR saving config: {exc}")
+
+    def _attempt_remote_config_upload(self) -> None:
+        if not self.backend.config_sync_supported():
+            return
+        tmp_remote = MCVAULT_TEMP_DIR / f"mcvault_upload_cfg_{uuid.uuid4().hex}.json"
+        try:
+            write_json(self.cfg_path, self.cfg)
+            write_json(tmp_remote, strip_device_local_keys(self.cfg))
+            ok = self.backend.upload_remote_config(tmp_remote, self.log)
+            self.log("Config sync: remote upload " + ("succeeded." if ok else "failed (offline?)."))
+        except Exception as exc:
+            self.log(f"Config sync: upload error — {exc}")
+        finally:
+            safe_unlink(tmp_remote)
+
+    def _config_sync_on_launch(self) -> None:
+        if not self.backend.config_sync_supported():
+            return
+        self.log("Config sync: checking remote...")
+        self.cfg = normalize_config(self.cfg)
+        write_json(self.cfg_path, self.cfg)
+        try:
+            remote_exists = self.backend.remote_config_exists()
+        except Exception:
+            remote_exists = False
+        if not remote_exists:
+            self.log("Config sync: no remote config found — uploading local.")
+            self._attempt_remote_config_upload()
+            return
+        tmp = MCVAULT_TEMP_DIR / f"mcvault_rcfg_{uuid.uuid4().hex}.json"
+        safe_unlink(tmp)
+        try:
+            downloaded = self.backend.download_remote_config(tmp, self.log)
+        except Exception:
+            downloaded = False
+        if not downloaded or not tmp.exists():
+            self.log("Config sync: could not fetch remote (offline?) — using local.")
+            safe_unlink(tmp)
+            return
+        remote_cfg = normalize_config(read_json(tmp) or {})
+        local_cfg  = normalize_config(read_json(self.cfg_path) or {})
+        safe_unlink(tmp)
+        r_dt = parse_iso_utc(remote_cfg.get("last_modified_utc", ""))
+        l_dt = parse_iso_utc(local_cfg.get("last_modified_utc", ""))
+        epoch = datetime.min.replace(tzinfo=timezone.utc)
+        if (r_dt or epoch) > (l_dt or epoch):
+            self.log("Config sync: remote is newer — applying.")
+            self.cfg = normalize_config(merge_remote_config(local_cfg, remote_cfg))
+            self._save_config_local()
+        else:
+            self.log("Config sync: local is newer — uploading.")
+            self.cfg = local_cfg
+            self._save_config_local()
+            self._attempt_remote_config_upload()
+        self.backend = build_backend(self.cfg)
+
+    # ------------------------------------------------------------------ USB helper
+    def _select_usb_drive(self) -> None:
+        candidates = list_usb_candidates()
+        items = candidates + ["[Enter path manually...]"]
+        choice = self.pick("Select USB Drive", "Choose the USB mount point:", items)
+        if not choice:
+            return
+        if choice == "[Enter path manually...]":
+            choice = self.enter_text(
+                "USB Root Path",
+                "Enter USB root path (e.g. E:\\ or /run/media/deck/USBNAME):",
+            )
+            if not choice:
+                return
+        self.cfg["usb_root"] = choice.strip()
+        self.cfg["usb_vault_name"] = "MinecraftVault"
+
+    # ------------------------------------------------------------------ menus
+    def _main_menu(self) -> None:
+        ITEMS = [
+            "⬆  Backup",
+            "⬇  Restore",
+            "≡  List Remote",
+            "⚙  Settings",
+            "✕  Quit",
+        ]
+        while True:
+            choice = self.pick("Main Menu", "MC Vault — choose an action:", ITEMS)
+            if choice is None or choice.startswith("✕"):
+                break
+            elif choice.startswith("⬆"):
+                self._do_backup()
+            elif choice.startswith("⬇"):
+                self._do_restore()
+            elif choice.startswith("≡"):
+                self._do_list_remote()
+            elif choice.startswith("⚙"):
+                self._do_settings()
+
+    def _do_backup(self) -> None:
+        try:
+            prism_root, _, _, standalone_path = resolve_world_source(self.cfg)
+
+            if standalone_path is not None:
+                world = standalone_path.name
+                world_path = standalone_path
+                local_inst = None
+            else:
+                instances = list_local_instances(prism_root)
+                if not instances:
+                    self.log("ERROR: No PrismLauncher instances found.")
+                    self._wait_for_key()
+                    return
+                local_inst = self.pick("Choose Instance",
+                                       "Select the local instance to back up from:", instances)
+                if not local_inst:
+                    return
+                worlds = list_local_worlds(prism_root, local_inst)
+                if not worlds:
+                    self.log("ERROR: No worlds found in this instance.")
+                    self._wait_for_key()
+                    return
+                world = self.pick("Choose World", "Select the world to back up:", worlds)
+                if not world:
+                    return
+                world_path = instance_mcdir(prism_root / "instances" / local_inst) / "saves" / world
+
+            remote_insts: List[str] = []
+            try:
+                remote_insts = self.backend.list_instances()
+            except Exception:
+                pass
+            default_folder = local_inst or world
+            ordered = [default_folder] + [r for r in remote_insts if r != default_folder]
+            ordered.append("[Create new folder...]")
+            remote_inst = self.pick("Destination Folder",
+                                    "Choose the remote instance folder to upload into:",
+                                    ordered)
+            if not remote_inst:
+                return
+            if remote_inst == "[Create new folder...]":
+                remote_inst = self.enter_text("New Folder",
+                                              "Enter remote instance folder name:", default_folder)
+                if not remote_inst:
+                    return
+
+            # Distant Horizons prompt
+            dh_choice: Optional[str] = None
+            has_dh, sz, _ = dh_detect(world_path)
+            if has_dh:
+                if self.cfg.get("dh_remember_choice"):
+                    dh_choice = self.cfg.get("dh_policy", "exclude")
+                else:
+                    raw = self.pick(
+                        "Distant Horizons Detected",
+                        f"DistantHorizons.sqlite found (~{format_size(sz)}). What to do?",
+                        ["exclude", "include", "delete locally"],
+                    )
+                    if not raw:
+                        return
+                    dh_choice = {"exclude": "exclude", "include": "include",
+                                 "delete locally": "delete"}[raw]
+
+            self.clear_log()
+            backup_operation(
+                world_path=world_path,
+                local_world=world,
+                remote_instance=remote_inst,
+                backend=self.backend,
+                cfg=self.cfg,
+                dh_choice=dh_choice,
+                log=self.log,
+                clear=self.clear_log,
+            )
+        except Exception as exc:
+            self.log(f"ERROR: {exc}")
+
+        self._wait_for_key("Backup finished — press any key to return to menu.")
+
+    def _do_restore(self) -> None:
+        try:
+            prism_root, _, _, standalone_path = resolve_world_source(self.cfg)
+
+            if standalone_path is not None:
+                confirm = self.pick(
+                    "Warning",
+                    "⚠ STANDALONE MODE: Restoring will OVERWRITE the server world folder.\n"
+                    f"  {standalone_path}\n\n"
+                    "The existing world will be deleted before extraction. Continue?",
+                    ["Yes, overwrite", "Cancel"],
+                )
+                if not confirm or confirm.startswith("Cancel"):
+                    return
+                dest_saves_dir = None
+            else:
+                instances = list_local_instances(prism_root)
+                if not instances:
+                    self.log("ERROR: No PrismLauncher instances found.")
+                    self._wait_for_key()
+                    return
+                local_inst = self.pick("Restore Target",
+                                       "Select the LOCAL instance to restore INTO:", instances)
+                if not local_inst:
+                    return
+                dest_saves_dir = instance_mcdir(prism_root / "instances" / local_inst) / "saves"
+
+            remote_insts = self.backend.list_instances()
+            if not remote_insts:
+                self.log("ERROR: No remote instances found.")
+                self._wait_for_key()
+                return
+
+            remote_inst = self.pick("Backup Source",
+                                    "Select the remote instance to restore FROM:", remote_insts)
+            if not remote_inst:
+                return
+
+            worlds = self.backend.list_worlds(remote_inst)
+            if not worlds:
+                self.log("ERROR: No worlds found in that remote instance.")
+                self._wait_for_key()
+                return
+
+            world = self.pick("Choose World", "Select the remote world to restore:", worlds)
+            if not world:
+                return
+
+            backups = self.backend.list_backups(remote_inst, world)
+            if not backups:
+                self.log("ERROR: No backups found for that world.")
+                self._wait_for_key()
+                return
+
+            backup = self.pick("Choose Backup", "Select the backup zip to restore:", backups)
+            if not backup:
+                return
+
+            self.clear_log()
+            restore_operation(
+                dest_saves_dir=dest_saves_dir,
+                remote_instance=remote_inst,
+                remote_world=world,
+                backup_zip=backup,
+                backend=self.backend,
+                log=self.log,
+                standalone_world_path=standalone_path,
+                clear=self.clear_log,
+            )
+        except Exception as exc:
+            self.log(f"ERROR: {exc}")
+
+        self._wait_for_key("Restore finished — press any key to return to menu.")
+
+    def _do_list_remote(self) -> None:
+        self.clear_log()
+        try:
+            insts = self.backend.list_instances()
+            if not insts:
+                self.log("No remote instances found.")
+            else:
+                self.log("Remote instances:")
+                for name in insts:
+                    worlds = self.backend.list_worlds(name)
+                    world_str = ", ".join(worlds) if worlds else "(empty)"
+                    self.log(f"  {name}/  →  {world_str}")
+        except Exception as exc:
+            self.log(f"ERROR: {exc}")
+        self._wait_for_key("Done — press any key to return to menu.")
+
+    def _do_settings(self) -> None:
+        c = self.cfg
+        while True:
+            standalone = c.get("standalone_world_dir") or "(not set)"
+            options = [
+                f"Set backend          (current: {c.get('default_backend')})",
+                f"Select USB drive     (current: {c.get('usb_root') or '(not set)'})",
+                f"Set USB root path manually",
+                f"Toggle dark mode     (current: {'on' if c.get('dark_mode') else 'off'})",
+                f"Set KEEP backups     (current: {c.get('keep_backups')})",
+                f"Set DH policy        (current: {c.get('dh_policy')})",
+                f"Toggle DH remember   (current: {'on' if c.get('dh_remember_choice') else 'off'})",
+                f"Set REMOTE root      (current: {c.get('remote_root')})",
+                f"Set RCLONE command   (current: {c.get('rclone_cmd')})",
+                f"Set standalone world (current: {standalone})",
+                f"Toggle force standalone (current: {'on' if c.get('force_standalone') else 'off'})",
+                f"Set drive chunk size    (current: {c.get('drive_chunk_size', '256M')})",
+                "← Back",
+            ]
+            choice = self.pick("Settings", "Choose a setting to change:", options)
+            if not choice or choice.startswith("←"):
+                break
+
+            try:
+                if choice.startswith("Set backend"):
+                    b = self.pick("Backend", "Choose backup storage:",
+                                  ["rclone (cloud)", "usb (removable drive)"])
+                    if b:
+                        self.cfg["default_backend"] = "rclone" if b.startswith("rclone") else "usb"
+                        if self.cfg["default_backend"] == "usb" and not (self.cfg.get("usb_root") or "").strip():
+                            self._select_usb_drive()
+
+                elif choice.startswith("Select USB"):
+                    self._select_usb_drive()
+
+                elif choice.startswith("Set USB root"):
+                    s = self.enter_text("USB Root Path",
+                                        "Enter USB root path (e.g. E:\\ or /run/media/deck/USBNAME):",
+                                        self.cfg.get("usb_root", ""))
+                    if s is not None:
+                        self.cfg["usb_root"] = s.strip()
+
+                elif choice.startswith("Toggle dark"):
+                    self.cfg["dark_mode"] = not self.cfg.get("dark_mode", False)
+
+                elif choice.startswith("Set KEEP"):
+                    s = self.enter_text("Keep Backups",
+                                        "How many backups to keep per world (0 = no pruning):",
+                                        str(self.cfg.get("keep_backups", KEEP_DEFAULT)))
+                    if s is not None:
+                        try:
+                            self.cfg["keep_backups"] = max(0, int(s))
+                        except ValueError:
+                            self.log("Invalid number — setting not changed.")
+                            continue
+
+                elif choice.startswith("Set DH"):
+                    p = self.pick("DH Policy",
+                                  "What should backup do with DistantHorizons.sqlite?",
+                                  ["exclude (recommended)", "include",
+                                   "delete locally (then exclude)"])
+                    if p:
+                        self.cfg["dh_policy"] = {
+                            "exclude (recommended)": "exclude",
+                            "include": "include",
+                            "delete locally (then exclude)": "delete",
+                        }[p]
+
+                elif choice.startswith("Toggle DH"):
+                    self.cfg["dh_remember_choice"] = not self.cfg.get("dh_remember_choice", False)
+
+                elif choice.startswith("Set REMOTE"):
+                    s = self.enter_text("Remote Root",
+                                        "Rclone remote root (e.g. gdrive:MinecraftVault):",
+                                        self.cfg.get("remote_root", REMOTE_DEFAULT))
+                    if s is not None:
+                        self.cfg["remote_root"] = s.strip()
+
+                elif choice.startswith("Set RCLONE"):
+                    s = self.enter_text("Rclone Command",
+                                        "Rclone executable path or command:",
+                                        self.cfg.get("rclone_cmd", RCLONE_DEFAULT))
+                    if s is not None:
+                        self.cfg["rclone_cmd"] = s.strip()
+
+                elif choice.startswith("Set standalone"):
+                    s = self.enter_text("Standalone World Dir",
+                                        "Path to world folder (e.g. ~/minecraft/world).\n"
+                                        "Leave blank to clear (use PrismLauncher instead):",
+                                        self.cfg.get("standalone_world_dir", ""))
+                    if s is not None:
+                        self.cfg["standalone_world_dir"] = s.strip()
+
+                elif choice.startswith("Toggle force standalone"):
+                    self.cfg["force_standalone"] = not self.cfg.get("force_standalone", False)
+
+                elif choice.startswith("Set drive chunk"):
+                    s = self.enter_text("Drive Chunk Size",
+                                        "rclone chunk size for uploads (e.g. 256M, 128M, 512M).\n"
+                                        "Larger chunks = fewer retries on big files:",
+                                        self.cfg.get("drive_chunk_size", "256M"))
+                    if s is not None:
+                        self.cfg["drive_chunk_size"] = s.strip() or "256M"
+
+                touch_config(self.cfg)
+                self._save_config_local()
+                self.backend = build_backend(self.cfg)
+                self.log("Settings updated.")
+
+            except Exception as exc:
+                self.log(f"ERROR in settings: {exc}")
+
+    # ------------------------------------------------------------------ helpers
+    def _wait_for_key(self, msg: str = "Press any key to continue...") -> None:
+        """Redraw the screen with a prompt and block until any key is pressed."""
+        rows, cols, log_rows, menu_row = self._dimensions()
+        self._scr.erase()
+        self._draw_chrome()
+        self._draw_log()
+        try:
+            self._scr.addnstr(rows - 1, 0, f" {msg} "[:cols - 1], cols - 1,
+                              curses.color_pair(_CP_DIM))
+        except curses.error:
+            pass
+        self._scr.refresh()
+        self._scr.getch()
+
+
+# =============================================================================
 # Entry Point
 # =============================================================================
 
+def _has_display() -> bool:
+    """Return True if a graphical display is likely available."""
+    if is_windows():
+        return True   # Windows always uses GUI unless --tui given
+    return bool(
+        os.environ.get("DISPLAY") or
+        os.environ.get("WAYLAND_DISPLAY") or
+        os.environ.get("MIR_SOCKET")
+    )
+
+
+def headless_backup(
+    remote_instance: Optional[str] = None,
+    world_dir: Optional[str] = None,
+    log_file: Optional[Path] = None,
+) -> int:
+    """
+    Non-interactive backup for scripted/automated use (--backup mode).
+
+    - World source: world_dir argument → standalone_world_dir config → Prism fallback
+    - Remote instance: remote_instance argument → world folder name
+    - Logs to stdout and optionally to log_file.
+    - Returns 0 on success, 1 on failure.
+    """
+    cfg_path = config_local_path()
+    cfg = normalize_config(read_json(cfg_path) or default_config())
+    backend = build_backend(cfg)
+
+    # Set up logging — tee to stdout and optional log file
+    log_fh: Optional[object] = None
+    if log_file is not None:
+        try:
+            ensure_dir(log_file.parent)
+            log_fh = open(log_file, "a", encoding="utf-8")
+        except OSError as exc:
+            print(f"WARN: could not open log file {log_file}: {exc}", flush=True)
+
+    def log(msg: str) -> None:
+        line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+        print(line, flush=True)
+        if log_fh is not None:
+            try:
+                log_fh.write(line + "\n")  # type: ignore[union-attr]
+                log_fh.flush()             # type: ignore[union-attr]
+            except OSError:
+                pass
+
+    log(f"{APP_NAME} v{APP_VERSION} — headless backup starting")
+
+    try:
+        MCVAULT_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Resolve world path
+        if world_dir:
+            world_path = Path(world_dir).expanduser().resolve()
+            if not world_path.is_dir():
+                raise RuntimeError(f"--world-dir path not found: {world_path}")
+        else:
+            # Override force_standalone temporarily if world_dir not given
+            _, _, _, standalone_path = resolve_world_source(cfg)
+            if standalone_path is not None:
+                world_path = standalone_path
+            else:
+                raise RuntimeError(
+                    "No world path given and no standalone_world_dir configured.\n"
+                    "Set standalone_world_dir in Settings or pass --world-dir."
+                )
+
+        world_name = world_path.name
+        remote_inst = remote_instance or world_name
+
+        log(f"World:           {world_path}")
+        log(f"Remote instance: {remote_inst}")
+        log(f"Backend:         {backend.name}")
+
+        # DH handling — use configured policy, no prompting
+        dh_choice = cfg.get("dh_policy", "exclude")
+        has_dh, sz, _ = dh_detect(world_path)
+        if has_dh:
+            log(f"Distant Horizons detected (~{format_size(sz)}) — policy: {dh_choice}")
+
+        backup_operation(
+            world_path=world_path,
+            local_world=world_name,
+            remote_instance=remote_inst,
+            backend=backend,
+            cfg=cfg,
+            dh_choice=dh_choice,
+            log=log,
+        )
+
+        log("Headless backup finished successfully.")
+        return 0
+
+    except Exception as exc:
+        log(f"ERROR: {exc}")
+        return 1
+
+    finally:
+        if log_fh is not None:
+            try:
+                log_fh.close()  # type: ignore[union-attr]
+            except OSError:
+                pass
+        shutil.rmtree(MCVAULT_TEMP_DIR, ignore_errors=True)
+
+
 if __name__ == "__main__":
-    app = VaultGUI()
-    app.root.mainloop()
+    import argparse
+
+    parser = argparse.ArgumentParser(description=f"{APP_NAME} v{APP_VERSION}")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--tui",    action="store_true",
+                       help="Launch the terminal UI (curses)")
+    group.add_argument("--gui",    action="store_true",
+                       help="Launch the graphical UI (tkinter, default when display available)")
+    group.add_argument("--backup", action="store_true",
+                       help="Run a non-interactive headless backup and exit")
+
+    parser.add_argument("--world-dir",       metavar="PATH",
+                        help="World folder to back up (--backup only; overrides config)")
+    parser.add_argument("--remote-instance", metavar="NAME",
+                        help="Remote instance folder name (--backup only; defaults to world name)")
+    parser.add_argument("--log-file",        metavar="PATH",
+                        help="Append backup log to this file (--backup only; "
+                             "defaults to ~/minecraft/backup.log)")
+    args = parser.parse_args()
+
+    if args.backup:
+        log_path = Path(args.log_file).expanduser() if args.log_file \
+                   else Path.home() / "minecraft" / "backup.log"
+        sys.exit(headless_backup(
+            remote_instance=args.remote_instance,
+            world_dir=args.world_dir,
+            log_file=log_path,
+        ))
+
+    use_tui = args.tui or (not args.gui and not _has_display())
+
+    if use_tui:
+        if not _CURSES_AVAILABLE:
+            print(
+                "Error: the 'curses' module is not available.\n"
+                "On Windows, install it with:  pip install windows-curses",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        VaultTUI().run()
+    else:
+        app = VaultGUI()
+        app.root.mainloop()
