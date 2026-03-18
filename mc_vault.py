@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MC Vault v0.4.0 — Cross-platform GUI/TUI tool for backing up and restoring
+MC Vault v0.4.1 — Cross-platform GUI/TUI tool for backing up and restoring
 Minecraft Java worlds for PrismLauncher instances.
 
 Single-file architecture. See DESIGN.md for full specification.
@@ -23,6 +23,7 @@ Environment variables (optional overrides):
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -38,10 +39,11 @@ import tkinter as tk
 from tkinter import ttk
 
 APP_NAME = "MC Vault"
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.4.1"
 CONFIG_VERSION = 1
 
 MCVAULT_TEMP_DIR = Path.home() / ".temp" / "mc_vault"
+BACKUP_STATUS_FILE = Path("/tmp/mcvault_status")
 
 REMOTE_DEFAULT = os.environ.get("REMOTE", "gdrive:MinecraftVault")
 
@@ -681,8 +683,87 @@ class UsbBackend(BackendBase):
 
 
 class LocalBackend(BackendBase):
-    """Stub for future local-folder backend."""
+    """Local filesystem backup to ~/minecraft/backups/[instance]/[zip]."""
     name = "local"
+
+    ROOT = Path.home() / "minecraft" / "backups"
+
+    def _instance_dir(self, instance: str) -> Path:
+        return self.ROOT / sanitize_path_component(instance)
+
+    def list_instances(self) -> List[str]:
+        if not self.ROOT.is_dir():
+            return []
+        return sorted(
+            p.name for p in self.ROOT.iterdir()
+            if p.is_dir() and not p.name.startswith(".")
+        )
+
+    def list_worlds(self, instance: str) -> List[str]:
+        """Derive world names from zip filenames (worldname_YYYY-MM-DD_...).zip"""
+        d = self._instance_dir(instance)
+        if not d.is_dir():
+            return []
+        worlds: set = set()
+        for z in d.glob("*.zip"):
+            parts = z.stem.split("_")
+            for i, part in enumerate(parts):
+                if len(part) == 4 and part.isdigit():
+                    worlds.add("_".join(parts[:i]))
+                    break
+        return sorted(worlds)
+
+    def list_backups(self, instance: str, world: str) -> List[str]:
+        d = self._instance_dir(instance)
+        if not d.is_dir():
+            return []
+        prefix = sanitize_path_component(world) + "_"
+        return sorted(
+            (z.name for z in d.glob("*.zip") if z.name.startswith(prefix)),
+            reverse=True,
+        )
+
+    def upload_backup(
+        self, local_zip: Path, instance: str, world: str,
+        zip_name: str, log: Callable[[str], None],
+        clear: Optional[Callable[[], None]] = None,
+    ) -> None:
+        dest_dir = self._instance_dir(instance)
+        ensure_dir(dest_dir)
+        dest = dest_dir / zip_name
+        log(f"Copying to local backups → {dest}")
+        shutil.copy2(str(local_zip), str(dest))
+        log(f"✓ Local backup saved.")
+
+    def download_backup(
+        self, instance: str, world: str, zip_name: str,
+        local_zip: Path, log: Callable[[str], None],
+        clear: Optional[Callable[[], None]] = None,
+    ) -> None:
+        src = self._instance_dir(instance) / sanitize_path_component(zip_name)
+        if not src.exists():
+            raise BackendError(f"Backup not found: {src}")
+        safe_unlink(local_zip)
+        log(f"Copying from local backups: {src} → {local_zip}")
+        shutil.copy2(str(src), str(local_zip))
+
+    def prune_backups(
+        self, instance: str, world: str, keep: int,
+        log: Callable[[str], None],
+    ) -> None:
+        if keep <= 0:
+            return
+        backups = self.list_backups(instance, world)
+        if len(backups) <= keep:
+            return
+        d = self._instance_dir(instance)
+        log(f"Pruning old local backups (keeping {keep})")
+        for old in backups[keep:]:
+            try:
+                (d / old).unlink(missing_ok=True)
+                log(f"  Deleted {old}")
+            except OSError as exc:
+                log(f"  WARN: could not delete {old}: {exc}")
 
 
 def build_backend(cfg: Dict) -> BackendBase:
@@ -2424,6 +2505,7 @@ def headless_backup(
     remote_instance: Optional[str] = None,
     world_dir: Optional[str] = None,
     log_file: Optional[Path] = None,
+    backend_override: Optional[str] = None,
 ) -> int:
     """
     Non-interactive backup for scripted/automated use (--backup mode).
@@ -2435,6 +2517,8 @@ def headless_backup(
     """
     cfg_path = config_local_path()
     cfg = normalize_config(read_json(cfg_path) or default_config())
+    if backend_override:
+        cfg["default_backend"] = backend_override
     backend = build_backend(cfg)
 
     # Set up logging — tee to stdout and optional log file
@@ -2446,6 +2530,12 @@ def headless_backup(
         except OSError as exc:
             print(f"WARN: could not open log file {log_file}: {exc}", flush=True)
 
+    def _write_status(msg: str) -> None:
+        try:
+            BACKUP_STATUS_FILE.write_text(msg, encoding="utf-8")
+        except OSError:
+            pass
+
     def log(msg: str) -> None:
         line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
         print(line, flush=True)
@@ -2455,7 +2545,28 @@ def headless_backup(
                 log_fh.flush()             # type: ignore[union-attr]
             except OSError:
                 pass
+        lo = msg.lower()
+        if "zipping" in lo:
+            _write_status("§e⚙ Backup: zipping world...")
+        elif "transferred" in lo and "%" in msg:
+            # rclone --progress byte-transfer line (may be embedded after \r):
+            # "Transferred: 2.3 GiB / 4.9 GiB, 47%, 3.6 MiB/s, ETA 2m30s"
+            m = re.search(
+                r'Transferred:\s+[\d.]+\s*\S+\s*/\s*[\d.]+\s*[^\s,]+,\s*(\d+)%,\s*([\d.]+\s*[A-Z]i?B/s)',
+                msg,
+            )
+            if m:
+                _write_status(f"§e⚙ Backup: uploading {m.group(1)}% §7({m.group(2)})")
+        elif "copying to local" in lo:
+            _write_status("§e⚙ Backup: copying locally...")
+        elif "uploading" in lo or "upload" in lo:
+            _write_status("§e⚙ Backup: uploading to cloud...")
+        elif "prun" in lo:
+            _write_status("§e⚙ Backup: pruning old backups...")
+        elif "complete" in lo or "finished" in lo:
+            _write_status("§a✓ Backup complete §7— §aserver restarting soon!")
 
+    _write_status("§e⚙ Backup starting...")
     log(f"{APP_NAME} v{APP_VERSION} — headless backup starting")
 
     try:
@@ -2514,6 +2625,10 @@ def headless_backup(
             except OSError:
                 pass
         shutil.rmtree(MCVAULT_TEMP_DIR, ignore_errors=True)
+        try:
+            BACKUP_STATUS_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
@@ -2535,15 +2650,19 @@ if __name__ == "__main__":
     parser.add_argument("--log-file",        metavar="PATH",
                         help="Append backup log to this file (--backup only; "
                              "defaults to ~/minecraft/backup.log)")
+    parser.add_argument("--backend",         metavar="NAME",
+                        help="Override configured backend for this run (--backup only; "
+                             "local | rclone | usb)")
     args = parser.parse_args()
 
     if args.backup:
         log_path = Path(args.log_file).expanduser() if args.log_file \
-                   else Path.home() / "minecraft" / "backup.log"
+                   else Path.home() / "minecraft" / "servermanager" / "backup.log"
         sys.exit(headless_backup(
             remote_instance=args.remote_instance,
             world_dir=args.world_dir,
             log_file=log_path,
+            backend_override=args.backend or None,
         ))
 
     use_tui = args.tui or (not args.gui and not _has_display())
